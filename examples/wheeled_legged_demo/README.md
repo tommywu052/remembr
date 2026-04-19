@@ -34,9 +34,133 @@
 | LLM（推理） | 本地 Ollama command-r | Remote Gemma4:e4b + tool calling |
 | Embedding | 本地 sentence-transformers (1024-dim) | Remote nomic-embed-text (768-dim) |
 | 向量 DB | Docker MilvusDB Standalone | Milvus Lite（本地檔案，無需 Docker） |
+| Agent 核心 | LangChain + LangGraph StateGraph | 原生 Ollama tool calling + 手寫迴圈 |
+| 工具框架 | LangChain StructuredTool + Pydantic v1 | 原生 JSON schema（Ollama API 直接接受） |
 | ASR | 本地 Whisper TRT | xiaozhi Realtime API (Azure OpenAI) |
 | 語音整合 | ROS2 /speech topic | xiaozhi 直接呼叫 LiteMemory + navigate |
 | Jetson 本地依賴 | PyTorch + VILA + Ollama + Docker | 僅 pymilvus + requests |
+
+### 輕量化改寫的技術分析
+
+本版本基於 `nova_carter_demo` 範例開發，保留了相同的 ROS2 topic 拓撲（CaptionerNode → MemoryBuilderNode → AgentNode），但對每個節點內部進行了全面輕量化改寫。以下說明各項改寫的技術原因。
+
+#### 1. Agent 核心：為何不用原版 ReMEmbRAgent？
+
+原版 `ReMEmbRAgent` 在 Jetson Orin NX 16GB 環境下存在三個根本問題：
+
+**（a）依賴鏈過重，Jetson 記憶體不足**
+
+原版 `ReMEmbRAgent.__init__()` 會立即載入本地 HuggingFace embedding 模型：
+```python
+# 原版 remembr_agent.py — 初始化就下載 1.3GB 模型到 GPU/RAM
+self.embeddings = HuggingFaceEmbeddings(model_name='mixedbread-ai/mxbai-embed-large-v1')
+```
+這需要 PyTorch + sentence-transformers + accelerate + deepspeed 全套，在 16GB 共享記憶體的 Jetson 上會與 ROS2、Nav2 等服務搶資源。本版本改用 Remote Ollama `nomic-embed-text`，Jetson 端零 AI 推論負擔。
+
+**（b）FunctionsWrapper 是 workaround，非原生 tool calling**
+
+原版的 `FunctionsWrapper._generate()` 並非使用 Ollama 原生 tool calling，而是把工具定義塞進 system prompt，讓 LLM 自己輸出 `{"tool": "xxx", "tool_input": {...}}` 格式的 JSON，再手動解析：
+```python
+# 原版 functions_wrapper.py — 「假」function calling
+DEFAULT_SYSTEM_TEMPLATE = """You have access to the following tools:
+{tools}
+You must always select one of the above tools and respond with only a JSON object matching the following schema:
+{{
+  "tool": <name of the selected tool>,
+  "tool_input": <parameters for the selected tool, matching the tool's JSON schema>
+}}
+"""
+```
+這種方式不穩定——LLM 可能輸出格式不正確、混入 markdown 標記、用錯引號（原始碼中有多處 `# NOTE THIS IS HACKY` 與 `import pdb; pdb.set_trace()` 除錯痕跡）。
+
+本版本使用的 Gemma4:e4b 在 Ollama 上支援**原生 tool calling**（`/api/chat` 的 `tools` 參數），模型層面直接回傳結構化 `tool_calls`，不需要 prompt engineering 或 JSON 解析：
+```python
+# 本版本 ollama_client.py — 原生 tool calling
+def chat_with_tools(self, messages, tools, model="gemma4:e4b", ...):
+    r = requests.post(f"{self.base_url}/api/chat",
+        json={"model": model, "messages": messages, "tools": tools, "stream": False, ...})
+    return r.json()["message"]  # 直接包含結構化 tool_calls
+```
+
+**（c）LangGraph StateGraph 功能等價於簡單迴圈**
+
+原版用 LangGraph 建構三節點狀態圖（`agent` → `action` → `agent` → ... → `generate`），但其核心邏輯——「呼叫 LLM → 有工具呼叫就執行 → 沒有就生成回答」——等價於一個 for 迴圈：
+```python
+# 本版本 agent_node.py — 25 行實現相同邏輯
+for round_i in range(max_tool_rounds):
+    response = self.ollama.chat_with_tools(messages=messages, tools=TOOLS, ...)
+    tool_calls = response.get("tool_calls")
+    if not tool_calls:
+        return self._parse_response(response.get("content", ""))
+    # ... 執行工具，結果加入 messages ...
+```
+去掉 LangGraph 同時省掉了 `langchain-community`、`langgraph`、`langchain_openai`、`langchain_nvidia_ai_endpoints`、`pydantic==1.10.18` 等依賴。
+
+#### 2. 工具框架：為何不用 LangChain StructuredTool？
+
+| 面向 | 原版 LangChain 方式 | 本版本原生 JSON 方式 |
+|------|---------------------|---------------------|
+| 依賴 | `langchain-core` + `pydantic v1`（已過時） | 零依賴，純 Python dict |
+| 相容性 | `pydantic==1.10.18` 鎖死版本，與 ROS2 Humble Python 3.10 環境易衝突 | 無版本衝突 |
+| 定義方式 | 每個工具需 Pydantic BaseModel + `StructuredTool.from_function` + `convert_to_openai_function` | 直接寫 JSON schema dict，Ollama API 原生接受 |
+
+原版每個工具需要繁瑣的 Pydantic class 定義：
+```python
+# 原版 — 每個工具都需要 Pydantic class
+class TextRetrieverInput(BaseModel):
+    x: str = Field(description="The query that will be searched...")
+self.retriever_tool = StructuredTool.from_function(func=..., args_schema=TextRetrieverInput)
+self.tool_definitions = [convert_to_openai_function(t) for t in self.tool_list]
+```
+
+本版本直接使用 Ollama 接受的 JSON schema：
+```python
+# 本版本 — 原生 JSON，無需中間轉換
+TOOLS = [{"type": "function", "function": {"name": "retrieve_from_text",
+    "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, ...}}}]
+```
+
+#### 3. Query 上下文：為何沒有附加時間？
+
+原版 Nova Carter 的 `agent_node.py` 中，附加時間的程式碼其實有 bug：
+```python
+# 原版 nova_carter_demo/agent_node.py — 存在 bug
+position, angle, current_time = format_pose_msg(self.last_pose)
+query += f"...the time is {self.current_time}."  # ← bug: self.current_time 未定義，應為 current_time
+```
+且 `common_utils.format_pose_msg()` 內也有變數名錯誤（`odom_msg` 應為 `msg`、`angle` 應為 `euler_rot_z`），因此原版的時間附加**從未正確執行過**。
+
+本版本修正了位姿解析的 bug（手算 yaw 取代 scipy、正確的浮點時間計算），目前只附加位置上下文，因為主要使用場景為空間導航型查詢（「帶我去 XX」「XX 在哪」）。如需支援時間型查詢（如「你 10 分鐘前看到什麼」），可在 `agent_node.py` 的 `_run_agent()` 中補回：
+```python
+from time import strftime, localtime
+t_str = strftime('%H:%M:%S', localtime(t))
+context += f" The current time is {t_str}."
+```
+
+#### 4. 相對原版修正的 Bug
+
+| Bug 位置 | 原版問題 | 本版本修正 |
+|----------|---------|-----------|
+| `common_utils.py:18` | `odom_msg.header.stamp` — 變數名錯誤（應為 `msg`） | `pose_msg_to_values()` 使用正確參數名 |
+| `common_utils.py:22` | return `angle` — 但上面定義的是 `euler_rot_z` | 手算 `math.atan2` 直接回傳 yaw |
+| `common_utils.py:19` | `float(str(sec) + '.' + str(nanosec))` — nanosec 位數不定時精度錯誤 | `float(sec) + float(nanosec) * 1e-9` |
+| `agent_node.py:74` | `self.current_time` — 未定義屬性（應為 local `current_time`） | 正確使用 local 變數 `t` |
+| `memory_builder_node.py:49` | callback 命名為 `query_callback` 但實際處理 caption | 正確命名為 `caption_callback` |
+
+#### 5. 改寫摘要
+
+```
+原版 Nova Carter 技術棧                     本版本輕量化替代
+───────────────────────                     ──────────────────
+本地 VILA 3B GPU 推論                    →  Remote Gemma4:e4b HTTP 呼叫
+本地 HuggingFace 1.3GB embedding model   →  Remote Ollama nomic-embed-text
+LangChain + LangGraph StateGraph         →  25 行 for 迴圈 + 原生 tool calling
+LangChain StructuredTool + Pydantic v1   →  原生 JSON schema dict
+Docker MilvusDB Standalone               →  Milvus Lite 單檔案（無 Docker）
+本地 Whisper TRT ASR                     →  xiaozhi Realtime API（Azure OpenAI）
+scipy.spatial.transform                  →  math.atan2 手算（無 scipy 依賴）
+requirements.txt 11 個重型依賴            →  僅 pymilvus + milvus-lite + requests
+```
 
 ## 檔案結構
 
