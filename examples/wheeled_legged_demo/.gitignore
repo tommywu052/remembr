@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.db
+*.db.lock
+.*.db.lock
+memory_report.html
+memory_images/
